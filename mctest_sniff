@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+import socket
+import struct
+import time
+import argparse
+
+
+//需要 root（或给 python 加 CAP_NET_RAW）
+//sudo python3 mcast_sniff.py 224.0.203.11 --iface enp2s0d1.110 --iface-ip 6.201.10.67
+
+
+def mac_str(b):
+    return ":".join(f"{x:02x}" for x in b)
+
+def parse_ipv4(pkt, off):
+    # IPv4 header minimum 20 bytes
+    if len(pkt) < off + 20:
+        return None
+    vihl = pkt[off]
+    ver = vihl >> 4
+    ihl = (vihl & 0x0F) * 4
+    if ver != 4 or ihl < 20 or len(pkt) < off + ihl:
+        return None
+    total_len = struct.unpack("!H", pkt[off+2:off+4])[0]
+    proto = pkt[off+9]
+    src = socket.inet_ntoa(pkt[off+12:off+16])
+    dst = socket.inet_ntoa(pkt[off+16:off+20])
+    return ihl, total_len, proto, src, dst
+
+def parse_udp(pkt, off):
+    if len(pkt) < off + 8:
+        return None
+    sport, dport, length = struct.unpack("!HHH", pkt[off:off+6])
+    return sport, dport, length
+
+def join_igmp(group_ip, iface_ip="0.0.0.0"):
+    """
+    用一个普通 UDP socket 发起 IP_ADD_MEMBERSHIP，让交换机/路由器知道本机要收这个组播。
+    注意：这一步不依赖端口（我们不收 UDP，只为 join）。
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    if iface_ip == "0.0.0.0":
+        mreq = struct.pack("4sl", socket.inet_aton(group_ip), socket.INADDR_ANY)
+    else:
+        mreq = socket.inet_aton(group_ip) + socket.inet_aton(iface_ip)
+
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    return s  # 保持 socket 不被回收，否则 membership 可能被释放
+
+def main():
+    p = argparse.ArgumentParser(description="Multicast receiver without knowing UDP port (AF_PACKET sniff)")
+    p.add_argument("group", help="组播IP，例如 224.0.203.11")
+    p.add_argument("--iface", required=True, help="抓包网卡名，例如 eth0 / enp2s0d1.110")
+    p.add_argument("--iface-ip", default="0.0.0.0", help="用于 IGMP join 的本地接口IP（可选）")
+    p.add_argument("--max-print", type=int, default=64, help="打印 payload 前 N 字节")
+    args = p.parse_args()
+
+    group_ip = args.group
+    iface = args.iface
+
+    # 先 join，让网络把该组播真正转发到这台机器（如果本来就泛洪/静态下发，也可以不要这步）
+    keep_join = join_igmp(group_ip, args.iface_ip)
+    print(f"✔ IGMP join {group_ip} (iface-ip={args.iface_ip})")
+
+    # AF_PACKET 抓二层帧（Linux only），需要 root/CAP_NET_RAW
+    raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
+    raw.bind((iface, 0))
+    print(f"✔ Sniffing on {iface} (no UDP port needed). Press Ctrl+C to stop.\n")
+
+    try:
+        while True:
+            pkt, sa = raw.recvfrom(65535)
+            if len(pkt) < 14:
+                continue
+
+            eth_type = struct.unpack("!H", pkt[12:14])[0]
+            # 只看 IPv4
+            if eth_type != 0x0800:
+                continue
+
+            ipinfo = parse_ipv4(pkt, 14)
+            if not ipinfo:
+                continue
+
+            ihl, total_len, proto, src_ip, dst_ip = ipinfo
+            if dst_ip != group_ip:
+                continue
+            # 只看 UDP
+            if proto != 17:
+                continue
+
+            udp_off = 14 + ihl
+            udpi = parse_udp(pkt, udp_off)
+            if not udpi:
+                continue
+            sport, dport, udplen = udpi
+
+            payload_off = udp_off + 8
+            payload = pkt[payload_off:payload_off + max(0, udplen - 8)]
+
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            sample = payload[:args.max_print]
+            hex_sample = " ".join(f"{b:02x}" for b in sample)
+            more = "" if len(payload) <= args.max_print else " ..."
+
+            print(f"[{ts}] {src_ip}:{sport} -> {dst_ip}:{dport}  payload_len={len(payload)}  {hex_sample}{more}")
+
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        raw.close()
+        keep_join.close()
+
+if __name__ == "__main__":
+    main()
