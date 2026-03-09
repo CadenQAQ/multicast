@@ -5,8 +5,8 @@ import time
 import argparse
 
 
-//需要 root（或给 python 加 CAP_NET_RAW）
-//sudo python3 mcast_sniff.py 224.0.203.11 --iface enp2s0d1.110 --iface-ip 6.201.10.67
+#需要 root（或给 python 加 CAP_NET_RAW）
+#sudo python3 mcast_sniff.py 224.0.203.11 --iface enp2s0d1.110 --iface-ip 6.201.10.67
 
 
 def mac_str(b):
